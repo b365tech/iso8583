@@ -719,3 +719,33 @@ As part of Moov's initiative to offer open source fintech infrastructure, we hav
 ## License
 
 Apache License 2.0 - See [LICENSE](LICENSE) for details.
+
+## Fork Versioning & Branch Strategy
+
+This repository is a fork of [moov-io/iso8583](https://github.com/moov-io/iso8583).
+
+We use our **own semantic versioning**, starting at `v1.0.0`, to track internal releases.
+
+### Fork Branches
+
+- `master`: Mirrors the latest changes from the upstream Moov repository.
+- `banc365-main`: Used for internal development, tagging, and versioned releases.
+
+All development and version tagging happens on `banc365-main`.
+
+### Fork Upstream Base
+
+Our first release, `v1.0.0`, is based on upstream tag [`v0.23.4`](https://github.com/moov-io/iso8583/releases/tag/v0.23.4). Releases will note their upstream base in the [CHANGELOG](./CHANGELOG.md).
+
+---
+
+## Fork Installation
+
+To install the library with a custom tag from this fork, use the following in your `go.mod` file:
+
+```go
+require github.com/moov-io/iso8583 v1.0.0
+replace github.com/moov-io/iso8583 => github.com/b365tech/iso8583 v1.0.0
+```
+
+This allows you to use our tagged versions under the original `moov-io/iso8583` import path, ensuring compatibility with your existing code.
