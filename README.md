@@ -719,3 +719,19 @@ As part of Moov's initiative to offer open source fintech infrastructure, we hav
 ## License
 
 Apache License 2.0 - See [LICENSE](LICENSE) for details.
+
+## Fork Versioning
+
+This fork of [moov-io/iso8583](https://github.com/moov-io/iso8583) uses its **own semantic versioning**, starting at `v1.0.0`.
+
+Our versioning follows the standard [Semantic Versioning](https://semver.org/) convention:
+
+```
+MAJOR.MINOR.PATCH
+```
+
+- We increment **MAJOR** when we make incompatible API or behavior changes.
+- We increment **MINOR** when we add functionality in a backwards-compatible manner.
+- We increment **PATCH** when we make backwards-compatible bug fixes.
+
+Each release in our fork will indicate the Moov tag or commit it was derived from in the [CHANGELOG](./CHANGELOG.md).
