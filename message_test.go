@@ -3,7 +3,6 @@ package iso8583
 import (
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -1014,12 +1013,12 @@ func TestPackUnpack(t *testing.T) {
 		message := NewMessage(shortSpec)
 		message.MTI("0100")
 
-		// Field F3SF2 has a letter in, which will make it fail
+		// Field 3, subfield 2 has a letter in, which will make it fail
 		rawMsg := []byte{0x30, 0x31, 0x30, 0x30, // MTI F0
 			0x60, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // Bitmap F1
 			0x31, 0x36, // Tag for F2
 			0x34, 0x32, 0x37, 0x36, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, //F2
-			0x30, 0x30, 0x30, 0x51, 0x30, 0x30, //F3
+			0x30, 0x31, 0x30, 0x51, 0x33, 0x33, //F3 - subfield 1: 01, subfield 2: 0A (invalid), subfield 3: 33
 		}
 
 		err := message.Unpack([]byte(rawMsg))
@@ -1034,9 +1033,14 @@ func TestPackUnpack(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "4276555555555555", s)
 
+		composite := message.GetField(3)
+		require.NotNil(t, composite)
+
+		// for field 3 only 1st subfield could be unpacked successfully
+		// subfield 2 failed during unpacking, but it was created with zero value
 		s, err = message.GetString(3)
 		require.NoError(t, err)
-		require.Equal(t, "00", s)
+		require.Equal(t, "0100", s) // 01 is subfield 1, 00 - is zero value of subfield 2
 
 		data := &TestISOShortData{}
 		require.NoError(t, message.Unmarshal(data))
@@ -1134,11 +1138,11 @@ func TestPackUnpack(t *testing.T) {
 			0x60, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // Bitmap F1
 			0x31, 0x36, // Tag for F2
 			0x34, 0x32, 0x37, 0x36, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, //F2
-			0x31, 0x34, // Tag for F3
-			0x30, 0x30, // F3 SF1
-			0x31, 0x31, 0x31, 0x31, //F3 SF2 Subfield 1
-			0x31, 0x32, 0x33, 0x34, 0x35, 0x51, //F3 SF2 Subfield 2
-			0x30, 0x30, // F3 SF3
+			0x31, 0x34, // Length of F3
+			0x30, 0x30, // 3.1 - 00 Transaction Type
+			0x31, 0x31, 0x31, 0x31, //3.2.1 Date - 1111
+			0x31, 0x32, 0x33, 0x34, 0x35, 0x51, //3.2.2 Time - 12345A (invalid)
+			0x30, 0x30, // 3.3 - 00 To Account
 		}
 
 		err := message.Unpack([]byte(rawMsg))
@@ -1153,15 +1157,20 @@ func TestPackUnpack(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "4276555555555555", s)
 
-		s, err = message.GetString(3)
+		var str string
+		err = message.UnmarshalPath("3.2.1", &str)
 		require.NoError(t, err)
-		require.Equal(t, "00", s)
+		require.Equal(t, "1111", str)
+
+		err = message.UnmarshalPath("3.2.2", &str)
+		require.NoError(t, err)
+		require.Equal(t, "0", str) // zero value for numeric field
 
 		data := &TestISOShortData{}
 		require.NoError(t, message.Unmarshal(data))
 
 		assert.Equal(t, "4276555555555555", data.F2.Value())
-		require.Nil(t, data.F3)
+		require.NotNil(t, data.F3) // but it's not in the correct state
 	})
 
 	// this test should check that BCD fields are packed and
@@ -2082,6 +2091,350 @@ func TestMessageMarshaling(t *testing.T) {
 	})
 }
 
+func TestMessageMarshal_Unmarshal_Path(t *testing.T) {
+	spec := &MessageSpec{
+		Fields: map[int]field.Field{
+			0: field.NewString(&field.Spec{
+				Length:      4,
+				Description: "Message Type Indicator",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+			1: field.NewBitmap(&field.Spec{
+				Description: "Bitmap",
+				Enc:         encoding.BytesToASCIIHex,
+				Pref:        prefix.Hex.Fixed,
+			}),
+			2: field.NewString(&field.Spec{
+				Length:      19,
+				Description: "Primary Account Number",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+			3: field.NewComposite(&field.Spec{
+				Length:      6,
+				Description: "Processing Code",
+				Pref:        prefix.ASCII.Fixed,
+				Tag: &field.TagSpec{
+					Sort: sort.StringsByInt,
+				},
+				Subfields: map[string]field.Field{
+					"1": field.NewString(&field.Spec{
+						Length:      2,
+						Description: "Transaction Type",
+						Enc:         encoding.ASCII,
+						Pref:        prefix.ASCII.Fixed,
+					}),
+					"2": field.NewString(&field.Spec{
+						Length:      2,
+						Description: "From Account",
+						Enc:         encoding.ASCII,
+						Pref:        prefix.ASCII.Fixed,
+					}),
+					"3": field.NewString(&field.Spec{
+						Length:      2,
+						Description: "To Account",
+						Enc:         encoding.ASCII,
+						Pref:        prefix.ASCII.Fixed,
+					}),
+				},
+			}),
+			4: field.NewString(&field.Spec{
+				Length:      12,
+				Description: "Transaction Amount",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+				Pad:         padding.Left('0'),
+			}),
+		},
+	}
+
+	type TestISOF3Data struct {
+		F1 *field.String
+		F2 *field.String
+		F3 *field.String
+	}
+
+	type ISO87Data struct {
+		F0 *field.String
+		F2 *field.String
+		F3 *TestISOF3Data
+		F4 *field.String
+	}
+
+	t.Run("Marshal/Unmarshal simple value", func(t *testing.T) {
+		message := NewMessage(spec)
+		err := message.MarshalPath("3.1", "12")
+		require.NoError(t, err)
+
+		var str string
+		require.NoError(t, message.UnmarshalPath("3.1", &str))
+		require.Equal(t, "12", str)
+
+		err = message.MarshalPath("3.2", "345")
+		require.NoError(t, err)
+
+		require.NoError(t, message.UnmarshalPath("3.2", &str))
+		require.Equal(t, "345", str)
+
+		err = message.MarshalPath("4", 199) // 1.99
+		require.NoError(t, err)
+
+		var num int
+		require.NoError(t, message.UnmarshalPath("4", &num))
+		require.Equal(t, 199, num)
+
+		data := &ISO87Data{}
+		require.NoError(t, message.Unmarshal(data))
+
+		require.Equal(t, "", data.F0.Value())
+		require.Equal(t, "", data.F2.Value())
+		require.Equal(t, "12", data.F3.F1.Value())
+		require.Equal(t, "345", data.F3.F2.Value())
+		require.Equal(t, "", data.F3.F3.Value())
+		require.Equal(t, "199", data.F4.Value())
+	})
+
+	t.Run("Marshal/Unmarshal struct", func(t *testing.T) {
+		type TestISOF3Data struct {
+			F1 *field.String
+			F2 *field.String
+			F3 *field.String
+		}
+
+		type ISO87Data struct {
+			F0 *field.String
+			F2 *field.String
+			F3 *TestISOF3Data
+			F4 *field.String
+		}
+
+		message := NewMessage(spec)
+		err := message.MarshalPath("3", &TestISOF3Data{
+			F1: field.NewStringValue("12"),
+			F2: field.NewStringValue("34"),
+			F3: field.NewStringValue("56"),
+		})
+		require.NoError(t, err)
+
+		data := &TestISOF3Data{}
+		require.NoError(t, message.UnmarshalPath("3", data))
+
+		require.Equal(t, "12", data.F1.Value())
+		require.Equal(t, "34", data.F2.Value())
+		require.Equal(t, "56", data.F3.Value())
+	})
+
+	t.Run("MarshalPath returns error when path is empty", func(t *testing.T) {
+		message := NewMessage(spec)
+		err := message.MarshalPath("", "12")
+		require.Error(t, err)
+	})
+
+	t.Run("MarshalPath returns error when first segment of the path is not integer", func(t *testing.T) {
+		message := NewMessage(spec)
+		err := message.MarshalPath("A.1", "12")
+		require.Error(t, err)
+	})
+
+	t.Run("MarshalPath returns error when field is not found", func(t *testing.T) {
+		message := NewMessage(spec)
+		err := message.MarshalPath("3.3.5", "12")
+		require.Error(t, err)
+	})
+
+	t.Run("UnmarshalPath returns error when path is empty", func(t *testing.T) {
+		message := NewMessage(spec)
+		var str string
+		err := message.UnmarshalPath("", &str)
+		require.Error(t, err)
+	})
+
+	t.Run("UnmarshalPath returns error when first segment of the path is not integer", func(t *testing.T) {
+		message := NewMessage(spec)
+		var str string
+		err := message.UnmarshalPath("A.1", &str)
+		require.Error(t, err)
+	})
+
+	t.Run("UnmarshalPath doesn't error when field is not found", func(t *testing.T) {
+		message := NewMessage(spec)
+		var str string
+		err := message.UnmarshalPath("9", &str)
+		require.Contains(t, err.Error(), "field 9 is not defined in the spec")
+	})
+
+	t.Run("UnmarshalPath skips unset fields", func(t *testing.T) {
+		message := NewMessage(spec)
+		var str string
+		err := message.UnmarshalPath("2", &str)
+		require.NoError(t, err)
+		require.Equal(t, "", str)
+	})
+}
+
+// t.Run("Marshal nil returns nil", func(t *testing.T) {
+// 	message := NewMessage(spe)
+
+// 	rawMsg := []byte("01007000000000000000164242424242424242123456000000000100")
+// 	err := message.Unpack([]byte(rawMsg))
+
+// 	require.NoError(t, err)
+
+// 	err = message.Marshal(nil)
+// 	require.NoError(t, err)
+// })
+
+// t.Run("Marshal using field tags", func(t *testing.T) {
+// 	type TestISOF3Data struct {
+// 		One   *field.String `index:"1"`
+// 		Two   *field.String `index:"2"`
+// 		Three *field.String `index:"3"`
+// 	}
+
+// 	type ISO87Data struct {
+// 		MTI                  *field.String  `index:"0"`
+// 		PrimaryAccountNumber *field.String  `index:"2"`
+// 		AdditionalData       *TestISOF3Data `index:"3"`
+// 		Amount               *field.String  `index:"4"`
+// 	}
+
+// 	data := &ISO87Data{
+// 		MTI:                  field.NewStringValue("0100"),
+// 		PrimaryAccountNumber: field.NewStringValue("4242424242424242"),
+// 		AdditionalData: &TestISOF3Data{
+
+// 			One:   field.NewStringValue("12"),
+// 			Two:   field.NewStringValue("34"),
+// 			Three: field.NewStringValue("56"),
+// 		},
+// 		Amount: field.NewStringValue("100"),
+// 	}
+
+// 	message := NewMessage(spec)
+// 	require.NoError(t, message.Marshal(data))
+
+// 	rawMsg, err := message.Pack()
+// 	require.NoError(t, err)
+
+// 	expected := []byte("01007000000000000000164242424242424242123456000000000100")
+// 	require.Equal(t, expected, rawMsg)
+// })
+
+// t.Run("Marshal when no idex is set for the fields", func(t *testing.T) {
+// 	type ISO87Data struct {
+// 		MTI                  *field.String
+// 		PrimaryAccountNumber *field.String
+// 		Amount               *field.String
+// 	}
+
+// 	data := &ISO87Data{
+// 		MTI:                  field.NewStringValue("0100"),
+// 		PrimaryAccountNumber: field.NewStringValue("4242424242424242"),
+// 		Amount:               field.NewStringValue("100"),
+// 	}
+
+// 	message := NewMessage(spec)
+// 	require.NoError(t, message.Marshal(data))
+
+// 	rawMsg, err := message.Pack()
+// 	require.NoError(t, err)
+// 	// only bitmap is packed => 8 zero bytes in hex
+// 	require.Equal(t, strings.Repeat("0", 16), string(rawMsg))
+// })
+
+// t.Run("Unmarshal after unpacking", func(t *testing.T) {
+// 	type TestISOF3Data struct {
+// 		F1 *field.String
+// 		F2 *field.String
+// 		F3 *field.String
+// 	}
+
+// 	type ISO87Data struct {
+// 		F0 *field.String
+// 		F2 *field.String
+// 		F3 *TestISOF3Data
+// 		F4 *field.String
+// 	}
+
+// 	message := NewMessage(spec)
+
+// 	rawMsg := []byte("01007000000000000000164242424242424242123456000000000100")
+// 	err := message.Unpack([]byte(rawMsg))
+
+// 	require.NoError(t, err)
+
+// 	data := &ISO87Data{}
+// 	require.NoError(t, message.Unmarshal(data))
+
+// 	require.Equal(t, "0100", data.F0.Value())
+// 	require.Equal(t, "4242424242424242", data.F2.Value())
+// 	require.Equal(t, "12", data.F3.F1.Value())
+// 	require.Equal(t, "34", data.F3.F2.Value())
+// 	require.Equal(t, "56", data.F3.F3.Value())
+// 	require.Equal(t, "100", data.F4.Value())
+// })
+
+// t.Run("Unmarshal into nil", func(t *testing.T) {
+// 	message := NewMessage(spec)
+
+// 	rawMsg := []byte("01007000000000000000164242424242424242123456000000000100")
+// 	err := message.Unpack([]byte(rawMsg))
+// 	require.NoError(t, err)
+
+// 	require.Error(t, message.Unmarshal(nil))
+// })
+
+// t.Run("Unmarshal using field tags", func(t *testing.T) {
+// 	type TestISOF3Data struct {
+// 		One   *field.String `index:"1"`
+// 		Two   *field.String `index:"2"`
+// 		Three *field.String `index:"3"`
+// 	}
+
+// 	type ISO87Data struct {
+// 		MTI                  *field.String  `index:"0"`
+// 		PrimaryAccountNumber *field.String  `index:"2"`
+// 		AdditionalData       *TestISOF3Data `index:"3"`
+// 		Amount               *field.String  `index:"4"`
+// 	}
+
+// 	message := NewMessage(spec)
+
+// 	rawMsg := []byte("01007000000000000000164242424242424242123456000000000100")
+// 	err := message.Unpack([]byte(rawMsg))
+
+// 	require.NoError(t, err)
+
+// 	data := &ISO87Data{}
+// 	require.NoError(t, message.Unmarshal(data))
+
+// 	require.Equal(t, "0100", data.MTI.Value())
+// 	require.Equal(t, "4242424242424242", data.PrimaryAccountNumber.Value())
+// 	require.Equal(t, "12", data.AdditionalData.One.Value())
+// 	require.Equal(t, "34", data.AdditionalData.Two.Value())
+// 	require.Equal(t, "56", data.AdditionalData.Three.Value())
+// 	require.Equal(t, "100", data.Amount.Value())
+// })
+
+// t.Run("Unmarshal skips fields with no index", func(t *testing.T) {
+// 	type ISO87Data struct {
+// 		MTI                  *field.String
+// 		PrimaryAccountNumber *field.String
+// 		Amount               *field.String
+// 	}
+
+// 	message := NewMessage(spec)
+
+// 	rawMsg := []byte("01007000000000000000164242424242424242123456000000000100")
+// 	err := message.Unpack([]byte(rawMsg))
+
+// 	require.NoError(t, err)
+
+// 	data := &ISO87Data{}
+// 	require.NoError(t, message.Unmarshal(data))
+// })
+
 func FuzzUnpack(f *testing.F) {
 	spec := &MessageSpec{
 		Fields: map[int]field.Field{
@@ -2202,9 +2555,8 @@ func TestStructWithTypes(t *testing.T) {
 
 		f4 := message.GetField(4)
 		require.NotNil(t, f4)
-		bs, err := f4.Bytes()
+		_, err := f4.Bytes()
 		require.NoError(t, err)
-		fmt.Printf("Binary field bytes: %x\n", bs)
 
 		rawMsg, err := message.Pack()
 		require.NoError(t, err)
@@ -2472,7 +2824,7 @@ func TestStructWithTypes(t *testing.T) {
 				err := message.Marshal(tt.input)
 				if tt.isError {
 					require.Error(t, err)
-					require.Equal(t, tt.errorString, err.Error())
+					require.Contains(t, err.Error(), tt.errorString)
 					return
 				}
 

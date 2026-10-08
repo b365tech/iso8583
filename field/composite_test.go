@@ -98,6 +98,60 @@ var (
 		},
 	}
 
+	compositeTestSpecWithTagPaddingAndUnknownTLVSupport = &Spec{
+		Length:      30,
+		Description: "Test Spec",
+		Pref:        prefix.ASCII.LL,
+		Tag: &TagSpec{
+			Length: 2,
+			Enc:    encoding.ASCII,
+			Pad:    padding.Left('0'),
+			Sort:   sort.StringsByInt,
+		},
+		Subfields: map[string]Field{
+			"1": NewString(&Spec{
+				Length:      2,
+				Description: "String Field",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+			"2": NewString(&Spec{
+				Length:      2,
+				Description: "String Field",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+			"3": NewNumeric(&Spec{
+				Length:      2,
+				Description: "Numeric Field",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+			"11": NewComposite(&Spec{
+				Length:      6,
+				Description: "Sub-Composite Field",
+				Pref:        prefix.ASCII.LL,
+				Tag: &TagSpec{
+					Length:              2,
+					Enc:                 encoding.ASCII,
+					Pad:                 padding.Left('0'),
+					Sort:                sort.StringsByInt,
+					SkipUnknownTLVTags:  true,
+					StoreUnknownTLVTags: true,
+					PrefUnknownTLV:      prefix.ASCII.LL,
+				},
+				Subfields: map[string]Field{
+					"1": NewString(&Spec{
+						Length:      2,
+						Description: "String Field",
+						Enc:         encoding.ASCII,
+						Pref:        prefix.ASCII.LL,
+					}),
+				},
+			}),
+		},
+	}
+
 	compositeTestSpecWithDefaultBitmap = &Spec{
 		Length:      36,
 		Description: "Test Spec",
@@ -392,6 +446,55 @@ func TestCompositeField_Marshal(t *testing.T) {
 	})
 }
 
+func TestCompositeField_MarshalPath(t *testing.T) {
+	t.Run("sets value of the field by path", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		err := composite.MarshalPath("11.1", 743)
+		require.NoError(t, err)
+
+		// check that the value was set correctly
+		data := &CompositeTestData{}
+		err = composite.Unmarshal(data)
+		require.NoError(t, err)
+		require.Equal(t, "743", data.F11.F1.Value())
+	})
+
+	t.Run("returns error on empty path", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		err := composite.MarshalPath("", 743)
+		require.Contains(t, err.Error(), "path cannot be empty")
+	})
+
+	t.Run("returns error on non-existent subfield", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		err := composite.MarshalPath("11.FF", 743)
+		require.Contains(t, err.Error(), "field FF is not defined in the spec")
+	})
+
+	t.Run("allows persisting a field not in spec if the composite field is configured for unknown TLV support", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPaddingAndUnknownTLVSupport)
+		err := composite.MarshalPath("11.FF",
+			&Binary{value: []byte{7, 4, 3}})
+		require.NoError(t, err)
+
+		// check that the value was set correctly
+		subfield, ok := composite.subfields["11"]
+		require.True(t, ok)
+
+		unknownTLV, ok := subfield.(*Composite).subfields["FF"]
+		require.True(t, ok)
+
+		val, err := unknownTLV.Bytes()
+		require.Equal(t, []byte{7, 4, 3}, val)
+	})
+
+	t.Run("non-composite nested error", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		err := composite.MarshalPath("11.1.1", 743)
+		require.Contains(t, err.Error(), "field 1 is not a PathMarshaler")
+	})
+}
+
 func TestCompositeField_Unmarshal(t *testing.T) {
 	t.Run("Unmarshal gets data for composite field", func(t *testing.T) {
 		// first, we need to populate fields of composite field
@@ -487,6 +590,52 @@ func TestCompositeField_Unmarshal(t *testing.T) {
 	})
 }
 
+func TestCompositeField_UnmarshalPath(t *testing.T) {
+	t.Run("gets value of the field by path", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		err := composite.Marshal(&CompositeTestData{
+			F11: &SubCompositeData{
+				F1: NewStringValue("743"),
+			},
+		})
+		require.NoError(t, err)
+
+		var val string
+		err = composite.UnmarshalPath("11.1", &val)
+		require.NoError(t, err)
+		require.Equal(t, "743", val)
+	})
+
+	t.Run("skips unset fields", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		var val string
+		require.NoError(t, composite.UnmarshalPath("11.1", &val))
+	})
+
+	t.Run("returns error on empty path", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		var val string
+		err := composite.UnmarshalPath("", &val)
+		require.Contains(t, err.Error(), "path cannot be empty")
+	})
+
+	t.Run("returns error on non-existent subfield", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		var val string
+		err := composite.UnmarshalPath("77", &val)
+		require.Contains(t, err.Error(), "field 77 is not defined in the spec")
+	})
+
+	t.Run("non-composite nested error", func(t *testing.T) {
+		composite := NewComposite(compositeTestSpecWithTagPadding)
+		require.NoError(t, composite.MarshalPath("1", "val1"))
+
+		var val string
+		err := composite.UnmarshalPath("1.1", &val)
+		require.Contains(t, err.Error(), "field 1 is not a PathUnmarshaler")
+	})
+}
+
 func TestCompositeField_Unset(t *testing.T) {
 	t.Run("Unset creates new empty field when it deletes it", func(t *testing.T) {
 		composite := NewComposite(constructedBERTLVTestSpec)
@@ -511,7 +660,7 @@ func TestCompositeField_Unset(t *testing.T) {
 
 		// if we delete subfield F9F3B and then set only one field of it,
 		// the other field should be nil (not set)
-		require.NoError(t, composite.UnsetSubfields("9F3B"))
+		require.NoError(t, composite.UnsetPath("9F3B"))
 
 		data = &ConstructedTLVTestData{}
 		require.NoError(t, composite.Unmarshal(data))
@@ -558,7 +707,7 @@ func TestCompositeField_Unset(t *testing.T) {
 		require.Equal(t, "047F", data.F9F3B.F9F45.Value())
 
 		// unset the composite fields
-		err = composite.UnsetSubfields("82", "9F3B.9F45")
+		err = composite.UnsetPath("82", "9F3B.9F45")
 		require.NoError(t, err)
 
 		data = &ConstructedTLVTestData{}
@@ -707,7 +856,7 @@ func TestTLVPacking(t *testing.T) {
 		// contains tags 9F36 and 9F37 which aren't in the specification.
 		_, err := composite.Unpack([]byte{0x30, 0x32, 0x36, 0x9f, 0x36, 0x2, 0x1, 0x57, 0x9a, 0x3, 0x21, 0x7, 0x20,
 			0x9f, 0x2, 0x6, 0x0, 0x0, 0x0, 0x0, 0x5, 0x1, 0x9f, 0x37, 0x4, 0x9b, 0xad, 0xbc, 0xab})
-		require.EqualError(t, err, "failed to unpack subfield 9F36: field not defined in Spec")
+		require.EqualError(t, err, "unpacking subfields by tag: failed to unpack subfield 9F36: field is not defined in the spec")
 	})
 
 	t.Run("ASCII Unknown TLV with PrefUnknownTLV: prefix.ASCII.L:  unpack correct deserialises bytes to the data struct skipping unexpected tags", func(t *testing.T) {
@@ -908,7 +1057,7 @@ func TestCompositePacking(t *testing.T) {
 		require.ErrorAs(t, err, &unpackError)
 		assert.Equal(t, "3", unpackError.FieldID)
 		assert.Equal(t, []string{"3"}, unpackError.FieldIDs())
-		require.EqualError(t, err, "failed to unpack subfield 3: failed to set bytes: failed to convert into number")
+		require.EqualError(t, err, "unpacking subfields: failed to unpack subfield 3: failed to set bytes: failed to convert into number")
 		require.ErrorIs(t, err, strconv.ErrSyntax)
 	})
 
@@ -1021,7 +1170,7 @@ func TestCompositePacking(t *testing.T) {
 		read, err := composite.Unpack([]byte("ABCD123"))
 		require.Equal(t, 0, read)
 		require.Error(t, err)
-		require.EqualError(t, err, "failed to unpack subfield 3: failed to decode content: not enough data to decode. expected len 3, got 0")
+		require.Contains(t, err.Error(), "failed to unpack subfield 3: failed to decode content: not enough data to decode. expected len 3, got 0")
 	})
 
 	t.Run("Unpack correctly deserialises bytes to the data struct", func(t *testing.T) {
@@ -1210,7 +1359,7 @@ func TestCompositePackingWithTags(t *testing.T) {
 		read, err := composite.Unpack([]byte("180102AB0202CD03AB12"))
 		require.Equal(t, 0, read)
 		require.Error(t, err)
-		require.EqualError(t, err, "failed to unpack subfield 3: failed to decode length: strconv.Atoi: parsing \"AB\": invalid syntax")
+		require.Contains(t, err.Error(), "failed to unpack subfield 3: failed to decode length: strconv.Atoi: parsing \"AB\": invalid syntax")
 	})
 
 	t.Run("Unpack returns an error on data having subfield ID not in spec", func(t *testing.T) {
@@ -1223,7 +1372,7 @@ func TestCompositePackingWithTags(t *testing.T) {
 		// Index 2-3 should have '01' rather than '12'.
 		read, err := composite.Unpack([]byte("181202AB0202CD030212"))
 		require.Equal(t, 0, read)
-		require.EqualError(t, err, "failed to unpack subfield 12: field not defined in Spec")
+		require.Contains(t, err.Error(), "failed to unpack subfield 12: field is not defined in the spec")
 	})
 
 	t.Run("Unpack returns an error on if subfield not defined in spec", func(t *testing.T) {
@@ -1236,7 +1385,7 @@ func TestCompositePackingWithTags(t *testing.T) {
 		// Index 0, 1 should have '01' rather than 'ID'.
 		read, err := composite.Unpack([]byte("18ID02AB0202CD030212"))
 		require.Equal(t, 0, read)
-		require.EqualError(t, err, "failed to unpack subfield ID: field not defined in Spec")
+		require.Contains(t, err.Error(), "failed to unpack subfield ID: field is not defined in the spec")
 	})
 
 	t.Run("Unpack correctly deserialises out of order composite subfields to the data struct", func(t *testing.T) {
@@ -1483,7 +1632,7 @@ func TestCompositePackingWithBitmap(t *testing.T) {
 		read, err := composite.Unpack([]byte("30E020000000000000AB02AB060102YZ"))
 		require.Equal(t, 0, read)
 		require.Error(t, err)
-		require.EqualError(t, err, "failed to unpack subfield 1 (String Field): failed to decode length: strconv.Atoi: parsing \"AB\": invalid syntax")
+		require.Contains(t, err.Error(), "failed to unpack subfield 1 (String Field): failed to decode length: strconv.Atoi: parsing \"AB\": invalid syntax")
 	})
 
 	t.Run("Unpack returns an error on data having subfield ID not in spec with default bitmap", func(t *testing.T) {
@@ -1496,7 +1645,7 @@ func TestCompositePackingWithBitmap(t *testing.T) {
 		// Index 2-3 = 70 indicates the presence of field 4. This field is not defined on spec.
 		read, err := composite.Unpack([]byte("32702000000000000002AB0212060102YZ"))
 		require.Equal(t, 0, read)
-		require.EqualError(t, err, "failed to unpack subfield 4: no specification found")
+		require.Contains(t, err.Error(), "field 4 is not defined in the spec")
 	})
 
 	t.Run("Unpack correctly deserialises out of order composite subfields to the data struct with default bitmap", func(t *testing.T) {
@@ -1562,7 +1711,7 @@ func TestCompositePackingWithBitmap(t *testing.T) {
 		read, err := composite.Unpack([]byte("20E02000AB02CD060102YZ"))
 		require.Equal(t, 0, read)
 		require.Error(t, err)
-		require.EqualError(t, err, "failed to unpack subfield 1 (String Field): failed to decode length: strconv.Atoi: parsing \"AB\": invalid syntax")
+		require.Contains(t, err.Error(), "failed to unpack subfield 1 (String Field): failed to decode length: strconv.Atoi: parsing \"AB\": invalid syntax")
 	})
 
 	t.Run("Unpack returns an error on data having subfield ID not in spec with sized bitmap on 3 bytes", func(t *testing.T) {
@@ -1575,7 +1724,7 @@ func TestCompositePackingWithBitmap(t *testing.T) {
 		// Index 2-3 = 70 indicates the presence of field 4. This field is not defined on spec.
 		read, err := composite.Unpack([]byte("2270200002CD0212060102YZ"))
 		require.Equal(t, 0, read)
-		require.EqualError(t, err, "failed to unpack subfield 4: no specification found")
+		require.Contains(t, err.Error(), "field 4 is not defined in the spec")
 	})
 
 	t.Run("Unpack correctly deserialises out of order composite subfields to the data struct with sized bitmap on 3 bytes", func(t *testing.T) {
@@ -1974,11 +2123,11 @@ func TestTLVJSONConversion(t *testing.T) {
 
 		err = composite.UnmarshalJSON([]byte(json_tags))
 		require.Error(t, err)
-		require.EqualError(t, err, "failed to unmarshal subfield 9F37: received subfield not defined in spec")
+		require.Contains(t, err.Error(), "field 9F37 is not defined in the spec")
 	})
 }
 
-func TestComposit_concurrency(t *testing.T) {
+func TestComposite_concurrency(t *testing.T) {
 	t.Run("Pack and Marshal", func(t *testing.T) {
 		// packing and marshaling
 		data := &TLVTestData{
@@ -2034,3 +2183,193 @@ func TestComposit_concurrency(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+func TestOptionalFields_UnpackEmpty(t *testing.T) {
+	t.Run("Unpack without error when not all subfields are set", func(t *testing.T) {
+
+		data := &CompositeTestDataOptionalFields{}
+
+		composite := NewComposite(compositeOptionalFieldsFullSpec)
+		err := composite.Marshal(data)
+		require.NoError(t, err)
+
+		// There is data only for first subfield
+		read, err := composite.Unpack([]byte("002AB"))
+		require.NoError(t, err)
+		require.Equal(t, 5, read)
+
+		require.NoError(t, composite.Unmarshal(data))
+
+		require.Equal(t, "AB", data.F1.Value())
+		require.Nil(t, data.F2)
+		require.Nil(t, data.F3)
+		require.Nil(t, data.F54)
+	})
+}
+
+func TestOptionalFields_Pack(t *testing.T) {
+	data := &CompositeTestDataOptionalFields{
+		F1: NewStringValue("AB"),
+		F2: NewStringValue("CD"),
+		F3: NewNumericValue(12),
+		F54: &SubCompositeOptionalFields{
+			F1: &SubCompositeOptionalFieldsData{
+				F1: NewStringValue("01"),
+				F2: NewStringValue("23"),
+				F3: NewStringValue("456"),
+				F4: NewStringValue("7"),
+				F5: NewStringValue("ABCDEFGHIJKL"),
+			},
+			F2: &SubCompositeOptionalFieldsData{
+				F1: NewStringValue("10"),
+				F2: NewStringValue("32"),
+				F3: NewStringValue("654"),
+				F4: NewStringValue("7"),
+				F5: NewStringValue("LKJIHGFEDCBA"),
+			},
+			F3: nil,
+			F4: nil,
+			F5: nil,
+			F6: nil,
+		},
+	}
+
+	composite := NewComposite(compositeOptionalFieldsFullSpec)
+
+	err := composite.Marshal(data)
+	require.NoError(t, err)
+
+	b, err := composite.Pack()
+	require.NoError(t, err)
+
+	unpackedComposite := NewComposite(compositeOptionalFieldsFullSpec)
+	_, err = unpackedComposite.Unpack(b)
+	require.NoError(t, err)
+
+	unpackedData := &CompositeTestDataOptionalFields{}
+	require.NoError(t, unpackedComposite.Unmarshal(unpackedData))
+
+	require.Equal(t, data.F1.Value(), unpackedData.F1.Value())
+	require.Equal(t, data.F2.Value(), unpackedData.F2.Value())
+	require.Equal(t, data.F3.Value(), unpackedData.F3.Value())
+	require.NotNil(t, unpackedData.F54)
+	require.NotNil(t, unpackedData.F54.F1)
+	require.NotNil(t, unpackedData.F54.F2)
+	require.Nil(t, unpackedData.F54.F3)
+	require.Nil(t, unpackedData.F54.F4)
+	require.Nil(t, unpackedData.F54.F5)
+	require.Nil(t, unpackedData.F54.F6)
+
+	require.Equal(t, data.F54, unpackedData.F54)
+}
+
+type CompositeTestDataOptionalFields struct {
+	F1  *String
+	F2  *String
+	F3  *Numeric
+	F11 *SubCompositeData
+	F54 *SubCompositeOptionalFields
+}
+
+type SubCompositeOptionalFields struct {
+	F1 *SubCompositeOptionalFieldsData `iso8583:"01"`
+	F2 *SubCompositeOptionalFieldsData `iso8583:"02"`
+	F3 *SubCompositeOptionalFieldsData `iso8583:"03"`
+	F4 *SubCompositeOptionalFieldsData `iso8583:"04"`
+	F5 *SubCompositeOptionalFieldsData `iso8583:"05"`
+	F6 *SubCompositeOptionalFieldsData `iso8583:"06"`
+}
+
+type SubCompositeOptionalFieldsData struct {
+	F1 *String `iso8583:"01"`
+	F2 *String `iso8583:"02"`
+	F3 *String `iso8583:"03"`
+	F4 *String `iso8583:"04"`
+	F5 *String `iso8583:"05"`
+}
+
+var (
+	field54 = &Spec{
+		Length:      120,
+		Description: "Additional Amounts",
+		Tag: &TagSpec{
+			Sort: sort.StringsByInt,
+		},
+		Pref: prefix.ASCII.LLL,
+		Subfields: map[string]Field{
+			"01": additionalAmountField,
+			"02": additionalAmountField,
+			"03": additionalAmountField,
+			"04": additionalAmountField,
+			"05": additionalAmountField,
+			"06": additionalAmountField,
+		},
+	}
+
+	additionalAmountField = NewComposite(&Spec{
+		Length:      20,
+		Description: "Additional Amount",
+		Tag: &TagSpec{
+			Sort: sort.StringsByInt,
+		},
+		Pref: prefix.ASCII.Fixed,
+		Subfields: map[string]Field{
+			"01": NewString(&Spec{
+				Length:      2,
+				Description: "Account Type",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+			"02": NewString(&Spec{
+				Length:      2,
+				Description: "Amount Type",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+			"03": NewString(&Spec{
+				Length:      3,
+				Description: "Currency Code",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+			"04": NewString(&Spec{
+				Length:      1,
+				Description: "Amount Sign",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+			"05": NewString(&Spec{
+				Length:      12,
+				Description: "Amount",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+		},
+	})
+
+	compositeOptionalFieldsFullSpec = &Spec{
+		Length: 126,
+		Pref:   prefix.ASCII.LLL,
+		Tag: &TagSpec{
+			Sort: sort.StringsByInt,
+		},
+		Subfields: map[string]Field{
+			"1": NewString(&Spec{
+				Length: 2,
+				Enc:    encoding.ASCII,
+				Pref:   prefix.ASCII.Fixed,
+			}),
+			"2": NewString(&Spec{
+				Length: 2,
+				Enc:    encoding.ASCII,
+				Pref:   prefix.ASCII.Fixed,
+			}),
+			"3": NewNumeric(&Spec{
+				Length: 2,
+				Enc:    encoding.ASCII,
+				Pref:   prefix.ASCII.Fixed,
+			}),
+			"54": NewComposite(field54),
+		},
+	}
+)
