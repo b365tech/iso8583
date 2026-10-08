@@ -37,8 +37,10 @@ ISO8583 implements an ISO 8583 message reader and writer in Go. ISO 8583 is an i
     - [Working with ISO 8583 Messages](#working-with-iso-8583-messages)
     - [Setting Message Data](#setting-message-data)
     - [Getting Message Data](#getting-message-data)
+    - [Partial Message Parsing (MessageScanner)](#partial-message-parsing-messagescanner)
 	- [Inspecting message fields](#inspecting-message-fields)
 	- [JSON Encoding and Decoding](#json-encoding-and-decoding)
+	- [Working with Unknown TLV Tags](#working-with-unknown-tlv-tags)
 - [ISO8583 CLI](#cli)
 - [Learn more](#learn-more)
 - [Getting help](#getting-help)
@@ -64,6 +66,16 @@ The following example demonstrates how to:
 - Unpack and parse a received message
 
 ```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/moov-io/iso8583"
+	"github.com/moov-io/iso8583/examples"
+)
+
 // Define types for the message fields
 type Authorization struct {
 	MTI                  string               `iso8583:"0"`  // Message Type Indicator
@@ -76,12 +88,12 @@ type Authorization struct {
 }
 
 type AcceptorInformation struct {
-	Name    string `index:"1"`
-	City    string `index:"2"`
-	Country string `index:"3"`
+	Name    string `iso8583:"1"`
+	City    string `iso8583:"2"`
+	Country string `iso8583:"3"`
 }
 
-func Example() {
+func main() {
 	// Pack the message
 	msg := iso8583.NewMessage(examples.Spec)
 
@@ -114,13 +126,31 @@ func Example() {
 	// ...
 
 	// Unpack the message
-	msg = iso8583.NewMessage(Spec)
+	msg = iso8583.NewMessage(examples.Spec)
 	err = msg.Unpack(packed)
 	if err != nil {
 		panic(err)
 	}
 
-	// Get the field values
+	// get individual field values
+	var amount int64
+	err = msg.UnmarshalPath("4", &amount)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Amount: %d\n", amount)
+
+	// get value of composite subfield
+	var acceptorName string
+	err = msg.UnmarshalPath("43.1", &acceptorName)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Acceptor Name: %s\n", acceptorName)
+
+	// Get the field values into data structure
 	authData = &Authorization{}
 	err = msg.Unmarshal(authData)
 	if err != nil {
@@ -237,9 +267,9 @@ type Authorization struct {
 }
 
 type Acceptor struct {
-    Name    string `index:"1"`
-    City    string `index:"2"`
-    Country string `index:"3"`
+    Name    string `iso8583:"1"`
+    City    string `iso8583:"2"`
+    Country string `iso8583:"3"`
 }
 ```
 
@@ -328,10 +358,10 @@ In previous versions, it was common to use package-specific field types. While s
 
 ```go
 type Authorization struct {
-    MTI         *field.String `index:"0"`
-    PAN         *field.String `index:"2"`
-    Amount      *field.Numeric `index:"4"`
-    LocalTime   *field.String `index:"12"`
+    MTI         *field.String `iso8583:"0"`
+    PAN         *field.String `iso8583:"2"`
+    Amount      *field.Numeric `iso8583:"4"`
+    LocalTime   *field.String `iso8583:"12"`
 }
 
 auth := &Authorization{
@@ -367,9 +397,9 @@ type Authorization struct {
 }
 
 type Acceptor struct {
-    Name    string `index:"1"`
-    City    string `index:"2"`
-    Country string `index:"3"`
+    Name    string `iso8583:"1"`
+    City    string `iso8583:"2"`
+    Country string `iso8583:"3"`
 }
 ```
 
@@ -435,10 +465,10 @@ Previously, it was common to use package-specific field types. While still suppo
 
 ```go
 type LegacyAuthorization struct {
-    MTI         *field.String  `index:"0"`
-    PAN         *field.String  `index:"2"`
-    Amount      *field.Numeric `index:"4"`
-    LocalTime   *field.String  `index:"12"`
+    MTI         *field.String  `iso8583:"0"`
+    PAN         *field.String  `iso8583:"2"`
+    Amount      *field.Numeric `iso8583:"4"`
+    LocalTime   *field.String  `iso8583:"12"`
 }
 
 var auth LegacyAuthorization
@@ -448,6 +478,52 @@ fmt.Println(auth.MTI.Value())
 fmt.Println(auth.Amount.Value())
 ```
 </details>
+
+### Partial Message Parsing (MessageScanner)
+
+When you only need to inspect a few fields from a raw message — for example, reading the MTI to decide how to route, or extracting the STAN for logging — you can use `MessageScanner` instead of unpacking the entire message.
+
+`MessageScanner` is a forward-only cursor that parses fields on demand. It consumes bytes sequentially but only returns the fields you ask for, making it lightweight and suitable for proxies and routers.
+
+```go
+s := iso8583.NewMessageScanner(spec, rawBytes)
+
+// Scan MTI to decide how to handle the message
+f, err := s.ScanField(0)
+if err != nil {
+    // handle error
+}
+
+mti, err := f.String()
+if err != nil {
+    // handle error
+}
+
+if mti == "0800" {
+    // Network management message — forward raw bytes to a
+    // dedicated handler without further parsing
+    handleNetworkMessage(rawBytes)
+    return
+}
+
+// For other messages, continue scanning to get STAN
+f, err = s.ScanField(11)
+if err != nil {
+    // handle error
+}
+
+stan, err := f.String()
+if err != nil {
+    // handle error
+}
+
+// Route or log based on MTI and STAN
+fmt.Printf("MTI: %s, STAN: %s\n", mti, stan)
+```
+
+Key behaviors:
+- **Forward-only**: fields must be scanned in ascending order. Scanning a field at or before the current position returns an error.
+- **Minimal allocations**: fields between the current position and the target are consumed from the byte stream but discarded. Only the requested field is allocated and returned.
 
 ### Inspecting Message Fields
 
@@ -534,6 +610,99 @@ if err := json.Unmarshal([]byte(input), message); err != nil {
 
 // access indidual fields or using struct
 ```
+
+### Working with Unknown TLV Tags
+
+Composite fields in ISO 8583 messages often use TLV (Tag-Length-Value) encoding. In practice, network specifications may include tags that you are not interested in and don't want to define in your Go specification. The library provides a way to skip, store, and inspect such unknown tags.
+
+#### Skipping Unknown Tags
+
+To skip unknown tags during unpacking, set `SkipUnknownTLVTags: true` in the `TagSpec` of the composite field. The behavior depends on the TLV encoding type:
+
+- **BER-TLV** fields: The parser knows how to read the tag and length of unknown tags automatically, so no additional configuration is needed.
+
+  ```go
+  Tag: &field.TagSpec{
+      Enc:                encoding.BerTLVTag,
+      Sort:               sort.StringsByHex,
+      SkipUnknownTLVTags: true, // skip tags not in Subfields
+  },
+  ```
+
+- **Non-BER TLV** fields: You must specify `PrefUnknownTLV` so the parser knows how to read the length of unknown tags. This only works when all tags in the composite field use a consistent tag length and length prefix format.
+
+  ```go
+  Tag: &field.TagSpec{
+      Length:             2,             // tag length in bytes
+      Enc:                encoding.ASCII,
+      Sort:               sort.Strings,
+      SkipUnknownTLVTags: true,
+      PrefUnknownTLV:     prefix.ASCII.L, // length prefix format for unknown tags
+  },
+  ```
+
+Without `SkipUnknownTLVTags`, the parser returns an error when it encounters a tag not defined in `Subfields`.
+
+#### Storing Unknown Tags
+
+By default, skipped tags are discarded. If you want to preserve them — for example, to re-pack the message with all original data intact — enable `StoreUnknownTLVTags`:
+
+```go
+Tag: &field.TagSpec{
+    Enc:                 encoding.BerTLVTag,
+    Sort:                sort.StringsByHex,
+    SkipUnknownTLVTags:  true,
+    StoreUnknownTLVTags: true, // keep unknown tags in the message
+},
+```
+
+When enabled, unknown tags are stored as `Binary` fields inside the composite. Packing the message again will include them in the output, preserving the original data.
+
+You can also manually set unknown tags on a composite field using `MarshalPath`. This is useful when you want to set a packable unknown field on the composite — for example, when reconstructing a message or adding tags that are not defined in the spec. The following conditions must be met:
+
+- Both `SkipUnknownTLVTags` and `StoreUnknownTLVTags` are enabled in the `TagSpec`
+- The value implements `field.Field` (e.g., `*field.Binary`)
+
+```go
+// Set an unknown tag on field 55
+err := msg.MarshalPath("55.9F36", &field.Binary{...})
+```
+
+#### Finding Unknown Tags with `UnknownTags`
+
+If you store unknown tags, you can use the `UnknownTags` helper to retrieve them from a message after unpacking. It returns a map of unknown fields keyed by their dot-separated path (e.g., `"55.9F36"` for unknown tag `9F36` inside field 55):
+
+```go
+msg := iso8583.NewMessage(spec)
+err := msg.Unpack(rawData)
+if err != nil {
+    // handle error
+}
+
+unknownTags := iso8583.UnknownTags(msg)
+for path, f := range unknownTags {
+    val, _ := f.Bytes()
+    fmt.Printf("Unknown tag at %s: %X\n", path, val)
+}
+```
+
+If you're working with a standalone `*field.Composite` (not a full message), use `UnknownCompositeTags` instead:
+
+```go
+composite := field.NewComposite(spec)
+_, err := composite.Unpack(rawData)
+if err != nil {
+    // handle error
+}
+
+unknownTags := iso8583.UnknownCompositeTags(composite)
+for path, f := range unknownTags {
+    val, _ := f.Bytes()
+    fmt.Printf("Unknown tag at %s: %X\n", path, val)
+}
+```
+
+> **Note:** `UnknownTags` and `UnknownCompositeTags` only return results when `StoreUnknownTLVTags` is enabled in the composite field specs. If unknown tags are skipped but not stored, they are discarded during unpacking and cannot be retrieved.
 
 ### Sending and Receiving Messages
 

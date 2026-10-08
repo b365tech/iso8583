@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,14 +28,11 @@ type Message struct {
 	spec         *MessageSpec
 	cachedBitmap *field.Bitmap
 
-	// stores all fields according to the spec
-	fields map[int]field.Field
-
-	// to guard fieldsMap
+	// to guard fields
 	mu sync.Mutex
 
-	// tracks which fields were set
-	fieldsMap map[int]struct{}
+	// stores all fields according to the spec
+	fields map[int]field.Field
 }
 
 func NewMessage(spec *MessageSpec) *Message {
@@ -43,17 +41,14 @@ func NewMessage(spec *MessageSpec) *Message {
 		panic(err) //nolint:forbidigo,nolintlint // as specs moslty static, we panic on spec validation errors
 	}
 
-	fields := spec.CreateMessageFields()
-
 	return &Message{
-		fields:    fields,
-		spec:      spec,
-		fieldsMap: map[int]struct{}{},
+		fields: make(map[int]field.Field),
+		spec:   spec,
 	}
 }
 
 // Deprecated. Use Marshal instead.
-func (m *Message) SetData(data interface{}) error {
+func (m *Message) SetData(data any) error {
 	return m.Marshal(data)
 }
 
@@ -71,23 +66,31 @@ func (m *Message) bitmap() *field.Bitmap {
 		return m.cachedBitmap
 	}
 
-	// We validate the presence and type of the bitmap field in
-	// spec.Validate() when we create the message so we can safely assume
-	// it exists and is of the correct type
-	m.cachedBitmap, _ = m.fields[bitmapIdx].(*field.Bitmap)
-	m.cachedBitmap.Reset()
+	// presence and type of m.spec.Fields[bitmapIdx] was validated in NewMessage
+	//nolint:forcetypeassert
+	bitmap := field.NewInstanceOf(m.spec.Fields[bitmapIdx]).(*field.Bitmap)
+	m.fields[bitmapIdx] = bitmap
+	bitmap.Reset()
 
-	m.fieldsMap[bitmapIdx] = struct{}{}
+	m.cachedBitmap = bitmap
 
 	return m.cachedBitmap
+}
+
+func (m *Message) resetBitmap() {
+	m.fields[bitmapIdx] = m.bitmap()
+	m.bitmap().Reset()
 }
 
 func (m *Message) MTI(val string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.fieldsMap[mtiIdx] = struct{}{}
-	m.fields[mtiIdx].SetBytes([]byte(val))
+	mti, err := m.getOrCreateField(mtiIdx)
+	if err != nil {
+		panic(fmt.Sprintf("required MTI field is missing: %v", err)) //nolint:forbidigo,nolintlint // as specs mostly static, we panic on spec validation errors
+	}
+	mti.SetBytes([]byte(val))
 }
 
 func (m *Message) GetSpec() *MessageSpec {
@@ -98,52 +101,116 @@ func (m *Message) Field(id int, val string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if f, ok := m.fields[id]; ok {
-		m.fieldsMap[id] = struct{}{}
-		return f.SetBytes([]byte(val))
+	field, err := m.getOrCreateField(id)
+	if err != nil {
+		return fmt.Errorf("getting or creating field %d: %w", id, err)
 	}
-	return fmt.Errorf("failed to set field %d. ID does not exist", id)
+
+	err = field.SetBytes([]byte(val))
+	if err != nil {
+		return fmt.Errorf("setting bytes for field %d: %w", id, err)
+	}
+
+	return nil
 }
 
 func (m *Message) BinaryField(id int, val []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if f, ok := m.fields[id]; ok {
-		m.fieldsMap[id] = struct{}{}
-		return f.SetBytes(val)
+	field, err := m.getOrCreateField(id)
+	if err != nil {
+		return fmt.Errorf("getting or creating field %d: %w", id, err)
 	}
-	return fmt.Errorf("failed to set binary field %d. ID does not exist", id)
+
+	err = field.SetBytes(val)
+	if err != nil {
+		return fmt.Errorf("setting bytes for field %d: %w", id, err)
+	}
+
+	return nil
 }
 
+// GetMTI returns the Message Type Indicator (MTI) of the message. It returns
+// an empty string if the MTI field is not set.
 func (m *Message) GetMTI() (string, error) {
-	// we validate the presence and type of the mti field in
-	// spec.Validate() when we create the message so we can safely assume
-	// it exists
-	return m.fields[mtiIdx].String()
+	return m.GetString(mtiIdx)
 }
 
+// GetString returns the string representation of the field with the given ID.
+// If the field does not exist in the message, an empty value will be returned. If
+// the field ID is not defined in the specification, an error will be returned.
 func (m *Message) GetString(id int) (string, error) {
-	if f, ok := m.fields[id]; ok {
-		// m.fieldsMap[id] = struct{}{}
-		return f.String()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	field, err := m.getField(id)
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("failed to get string for field %d. ID does not exist", id)
+
+	if field == nil {
+		return "", nil
+	}
+
+	str, err := field.String()
+	if err != nil {
+		return "", fmt.Errorf("getting string for field %d: %w", id, err)
+	}
+
+	return str, nil
 }
 
+// GetBytes returns the byte slice representation of the field with the given ID.
+// If the field does not exist in the message, nil will be returned. If the field ID
+// is not defined in the specification, an error will be returned.
 func (m *Message) GetBytes(id int) ([]byte, error) {
-	if f, ok := m.fields[id]; ok {
-		// m.fieldsMap[id] = struct{}{}
-		return f.Bytes()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	field, err := m.getField(id)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("failed to get bytes for field %d. ID does not exist", id)
+
+	if field == nil {
+		return nil, nil
+	}
+
+	bytes, err := field.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("getting bytes for field %d: %w", id, err)
+	}
+
+	return bytes, nil
 }
 
+// GetField returns the field with the given ID, or nil if the field is not set
+// or not defined in the specification.
 func (m *Message) GetField(id int) field.Field {
-	return m.fields[id]
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	field, _ := m.getField(id)
+
+	return field
 }
 
-// Fields returns the map of the set fields
+func (m *Message) getField(id int) (field.Field, error) {
+	f := m.fields[id]
+	if f == nil {
+		if _, ok := m.spec.Fields[id]; !ok {
+			return nil, fmt.Errorf("field %d is not defined in the spec", id)
+		}
+
+		return nil, nil
+	}
+
+	return f, nil
+}
+
+// Fields returns the copy of the map of the set fields in the message. Be aware
+// that fields are live references, so modifying them will affect the message.
 func (m *Message) GetFields() map[int]field.Field {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,11 +221,7 @@ func (m *Message) GetFields() map[int]field.Field {
 // getFields returns the map of the set fields. It assumes that the mutex
 // is already locked by the caller.
 func (m *Message) getFields() map[int]field.Field {
-	fields := map[int]field.Field{}
-	for i := range m.fieldsMap {
-		fields[i] = m.GetField(i)
-	}
-	return fields
+	return maps.Clone(m.fields)
 }
 
 // Pack locks the message, packs its fields, and then unlocks it.
@@ -188,7 +251,8 @@ func (m *Message) wrapErrorPack() ([]byte, error) {
 // after ensuring concurrency safety.
 func (m *Message) pack() ([]byte, error) {
 	packed := []byte{}
-	m.bitmap().Reset()
+
+	m.resetBitmap()
 
 	ids, err := m.packableFieldIDs()
 	if err != nil {
@@ -212,10 +276,9 @@ func (m *Message) pack() ([]byte, error) {
 			continue
 		}
 
-		field, ok := m.fields[i]
-		if !ok {
-			return nil, fmt.Errorf("failed to pack field %d: no specification found", i)
-		}
+		// m.fields[i] must have the field as we got i from packableFieldIDs()
+		field := m.fields[i]
+
 		packedField, err := field.Pack()
 		if err != nil {
 			return nil, fmt.Errorf("failed to pack field %d (%s): %w", i, field.Spec().Description, err)
@@ -253,30 +316,31 @@ func (m *Message) wrapErrorUnpack(src []byte) error {
 // not handle locking or error wrapping and should typically be used internally
 // after ensuring concurrency safety.
 func (m *Message) unpack(src []byte) (string, error) {
-	var off int
+	// reset fields
+	m.fields = make(map[int]field.Field)
 
-	// reset fields that were set
-	m.fieldsMap = map[int]struct{}{}
+	// it implicitly sets the bitmap field in m.fields
+	m.resetBitmap()
 
-	// This method implicitly also sets m.fieldsMap[bitmapIdx]
-	m.bitmap().Reset()
+	mti, err := m.createField(mtiIdx)
+	if err != nil {
+		return strconv.Itoa(mtiIdx), fmt.Errorf("getting or creating MTI field: %w", err)
+	}
 
-	read, err := m.fields[mtiIdx].Unpack(src)
+	read, err := mti.Unpack(src)
 	if err != nil {
 		return strconv.Itoa(mtiIdx), fmt.Errorf("failed to unpack MTI: %w", err)
 	}
 
-	m.fieldsMap[mtiIdx] = struct{}{}
-
-	off = read
+	offset := read
 
 	// unpack Bitmap
-	read, err = m.fields[bitmapIdx].Unpack(src[off:])
+	read, err = m.bitmap().Unpack(src[offset:])
 	if err != nil {
 		return strconv.Itoa(bitmapIdx), fmt.Errorf("failed to unpack bitmap: %w", err)
 	}
 
-	off += read
+	offset += read
 
 	for i := 2; i <= m.bitmap().Len(); i++ {
 		// skip bitmap presence bits (for default bitmap length of 64 these are bits 1, 65, 129, 193, etc.)
@@ -285,19 +349,17 @@ func (m *Message) unpack(src []byte) (string, error) {
 		}
 
 		if m.bitmap().IsSet(i) {
-			fl, ok := m.fields[i]
-			if !ok {
-				return strconv.Itoa(i), fmt.Errorf("failed to unpack field %d: no specification found", i)
+			fl, err := m.createField(i)
+			if err != nil {
+				return strconv.Itoa(i), fmt.Errorf("creating field %d: %w", i, err)
 			}
 
-			read, err = fl.Unpack(src[off:])
+			read, err = fl.Unpack(src[offset:])
 			if err != nil {
 				return strconv.Itoa(i), fmt.Errorf("failed to unpack field %d (%s): %w", i, fl.Spec().Description, err)
 			}
 
-			m.fieldsMap[i] = struct{}{}
-
-			off += read
+			offset += read
 		}
 	}
 
@@ -344,51 +406,35 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 			return fmt.Errorf("failed to unmarshal field %v: could not convert to int", i)
 		}
 
-		field, ok := m.fields[i]
-		if !ok {
-			return fmt.Errorf("failed to unmarshal field %d: no specification found", i)
+		field, err := m.getOrCreateField(i)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal field %d: %w", i, err)
 		}
 
 		if err := json.Unmarshal(rawMsg, field); err != nil {
 			return utils.NewSafeErrorf(err, "failed to unmarshal field %v", id)
 		}
-
-		m.fieldsMap[i] = struct{}{}
 	}
 
 	return nil
 }
 
 func (m *Message) packableFieldIDs() ([]int, error) {
-	// Index 1 represent bitmap which is always populated.
-	populatedFieldIDs := []int{1}
-
-	for id := range m.fieldsMap {
-		// represents the bitmap
-		if id == 1 {
-			continue
-		}
-
-		populatedFieldIDs = append(populatedFieldIDs, id)
-	}
-
-	sort.Ints(populatedFieldIDs)
-
-	return populatedFieldIDs, nil
+	return slices.Sorted(maps.Keys(m.fields)), nil
 }
 
 // Clone clones the message by creating a new message from the binary
 // representation of the original message
 func (m *Message) Clone() (*Message, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	newMessage := NewMessage(m.spec)
 
+	m.mu.Lock()
 	bytes, err := m.wrapErrorPack()
 	if err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
+	m.mu.Unlock()
 
 	mti, err := m.GetMTI()
 	if err != nil {
@@ -427,7 +473,12 @@ func (m *Message) Marshal(v interface{}) error {
 		return errors.New("data is not a struct")
 	}
 
-	return m.marshalStruct(dataStruct)
+	err := m.marshalStruct(dataStruct)
+	if err != nil {
+		return fmt.Errorf("marshaling struct: %w", err)
+	}
+
+	return nil
 }
 
 // marshalStruct is a helper method that handles the core logic of marshaling a struct.
@@ -441,13 +492,6 @@ func (m *Message) marshalStruct(dataStruct reflect.Value) error {
 
 		// If the field has an index tag, process it normally
 		if indexTag.ID >= 0 {
-			messageField := m.GetField(indexTag.ID)
-			// if struct field we are using to populate value expects to
-			// set index of the field that is not described by spec
-			if messageField == nil {
-				return fmt.Errorf("no message field defined by spec with index: %d", indexTag.ID)
-			}
-
 			dataField := dataStruct.Field(i)
 			// for non pointer fields we need to check if they are zero
 			// and we want to skip them (as specified in the field tag)
@@ -455,11 +499,15 @@ func (m *Message) marshalStruct(dataStruct reflect.Value) error {
 				continue
 			}
 
+			messageField, err := m.getOrCreateField(indexTag.ID)
+			if err != nil {
+				return fmt.Errorf("getting or creating field %d: %w", indexTag.ID, err)
+			}
+
 			if err := messageField.Marshal(dataField.Interface()); err != nil {
 				return fmt.Errorf("failed to set value to field %d: %w", indexTag.ID, err)
 			}
 
-			m.fieldsMap[indexTag.ID] = struct{}{}
 			continue
 		}
 
@@ -515,19 +563,15 @@ func (m *Message) Unmarshal(v interface{}) error {
 // don't have index tags themselves.
 func (m *Message) unmarshalStruct(dataStruct reflect.Value) error {
 	// iterate over struct fields
-	for i := 0; i < dataStruct.NumField(); i++ {
+	for i := range dataStruct.NumField() {
 		structField := dataStruct.Type().Field(i)
 		indexTag := field.NewIndexTag(structField)
 
 		// If the field has an index tag, process it normally
 		if indexTag.ID >= 0 {
-			// we can get data only if field value is set
-			messageField := m.GetField(indexTag.ID)
+			// skip if field is not set in the message
+			messageField := m.fields[indexTag.ID]
 			if messageField == nil {
-				continue
-			}
-
-			if _, set := m.fieldsMap[indexTag.ID]; !set {
 				continue
 			}
 
@@ -595,51 +639,175 @@ func (m *Message) UnsetField(id int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.fieldsMap[id]; ok {
-		delete(m.fieldsMap, id)
-		// re-create the field to reset its value (and subfields if it's a composite field)
-		if fieldSpec, ok := m.GetSpec().Fields[id]; ok {
-			m.fields[id] = createMessageField(fieldSpec)
-		}
+	m.unsetField(id)
+}
+
+func (m *Message) unsetField(id int) {
+	delete(m.fields, id)
+}
+
+func (m *Message) getOrCreateField(id int) (field.Field, error) {
+	f := m.fields[id]
+	if f != nil {
+		return f, nil
 	}
+
+	f, err := m.createField(id)
+	if err != nil {
+		return nil, fmt.Errorf("creating field %d: %w", id, err)
+	}
+
+	return f, nil
+}
+
+func (m *Message) createField(id int) (field.Field, error) {
+	specField, ok := m.GetSpec().Fields[id]
+	if !ok {
+		return nil, fmt.Errorf("field %d is not defined in the spec", id)
+	}
+	f := field.NewInstanceOf(specField)
+	m.fields[id] = f
+
+	return f, nil
 }
 
 // UnsetFields marks multiple fields identified by their paths as not set and
 // replaces them with new zero-valued fields. Each path should be in the format
 // "a.b.c". This effectively removes the fields' values and excludes them from
 // operations like Pack() or Marshal().
+// Deprecated: use UnsetPath instead.
 func (m *Message) UnsetFields(idPaths ...string) error {
+	return m.UnsetPath(idPaths...)
+}
+
+// UnsetPath marks multiple fields identified by their paths as not set and
+// replaces them with new zero-valued fields. Each path should be in the format
+// "a.b.c". This effectively removes the fields' values and excludes them from
+// operations like Pack() or Marshal().
+func (m *Message) UnsetPath(idPaths ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	for _, idPath := range idPaths {
 		if idPath == "" {
 			continue
 		}
 
-		id, path, _ := strings.Cut(idPath, ".")
+		id, path, hasSubpath := strings.Cut(idPath, ".")
 		idx, err := strconv.Atoi(id)
 		if err != nil {
 			return fmt.Errorf("conversion of %s to int failed: %w", id, err)
 		}
 
-		if _, ok := m.fieldsMap[idx]; ok {
-			if len(path) == 0 {
-				m.UnsetField(idx)
-				continue
-			}
-
-			f := m.fields[idx]
-			if f == nil {
-				return fmt.Errorf("field %d does not exist", idx)
-			}
-
-			composite, ok := f.(*field.Composite)
-			if !ok {
-				return fmt.Errorf("field %d is not a composite field and its subfields %s cannot be unset", idx, path)
-			}
-
-			if err := composite.UnsetSubfields(path); err != nil {
-				return fmt.Errorf("failed to unset %s in composite field %d: %w", path, idx, err)
-			}
+		f := m.fields[idx]
+		// field is not set, continue
+		if f == nil {
+			continue
 		}
+
+		// If there's no subpath, unset the entire field
+		if !hasSubpath {
+			m.unsetField(idx)
+			continue
+		}
+
+		// Handle composite field with subpaths
+		pathUnsetter, ok := f.(field.PathUnsetter)
+		if !ok {
+			return fmt.Errorf("field %d is not a composite field and its subfields %s cannot be unset", idx, path)
+		}
+
+		if err := pathUnsetter.UnsetPath(path); err != nil {
+			return fmt.Errorf("failed to unset %s in composite field %d: %w", path, idx, err)
+		}
+	}
+
+	return nil
+}
+
+func (m *Message) MarshalPath(path string, value any) error {
+	if path == "" {
+		return errors.New("path cannot be empty")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id, subPath, hasSubPath := strings.Cut(path, ".")
+	idx, err := strconv.Atoi(id)
+	if err != nil {
+		return fmt.Errorf("conversion of %s to int failed: %w", id, err)
+	}
+
+	f, err := m.getOrCreateField(idx)
+	if err != nil {
+		return fmt.Errorf("getting or creating field %s: %w", id, err)
+	}
+
+	if hasSubPath {
+		mField, ok := f.(field.PathMarshaler)
+		if !ok {
+			return fmt.Errorf("field %s is not a PathMarshaler", id)
+		}
+
+		err := mField.MarshalPath(subPath, value)
+		if err != nil {
+			return fmt.Errorf("marshaling filed %s: %w", id, err)
+		}
+
+		return nil
+	}
+
+	err = f.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshaling field %s: %w", id, err)
+	}
+
+	return nil
+}
+
+func (m *Message) UnmarshalPath(path string, value any) error {
+	if path == "" {
+		return errors.New("path cannot be empty")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id, subPath, hasSubPath := strings.Cut(path, ".")
+	idx, err := strconv.Atoi(id)
+	if err != nil {
+		return fmt.Errorf("conversion of %s to int failed: %w", id, err)
+	}
+
+	f := m.fields[idx]
+	if f == nil {
+		// check if field exists in spec
+		_, ok := m.spec.Fields[idx]
+		if !ok {
+			return fmt.Errorf("field %d is not defined in the spec", idx)
+		}
+
+		return nil
+	}
+
+	if hasSubPath {
+		uField, ok := f.(field.PathUnmarshaler)
+		if !ok {
+			return fmt.Errorf("field %s is not a PathUnmarshaler", id)
+		}
+
+		err := uField.UnmarshalPath(subPath, value)
+		if err != nil {
+			return fmt.Errorf("unmarshaling filed %s: %w", id, err)
+		}
+
+		return nil
+	}
+
+	err = f.Unmarshal(value)
+	if err != nil {
+		return fmt.Errorf("unmarshaling field %s: %w", id, err)
 	}
 
 	return nil
