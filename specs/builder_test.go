@@ -499,3 +499,282 @@ func TestExportImportWithNonePrefixField(t *testing.T) {
 	spec, err = ImportJSON(specJSON)
 	require.NoError(t, err)
 }
+
+// Export names field types with reflection, so any field type in the library
+// can be written to a spec document, while import resolves them through
+// FieldConstructor. This pins the round trip for every field type so the two
+// directions cannot drift apart.
+func TestExportImportAllFieldTypes(t *testing.T) {
+	spec := &iso8583.MessageSpec{
+		Name: "all field types",
+		Fields: map[int]field.Field{
+			0: field.NewString(&field.Spec{
+				Length:      4,
+				Description: "Message Type Indicator",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.Fixed,
+			}),
+			1: field.NewBitmap(&field.Spec{
+				Length:      16,
+				Description: "Bitmap",
+				Enc:         encoding.BytesToASCIIHex,
+				Pref:        prefix.Hex.Fixed,
+			}),
+			2: field.NewNumeric(&field.Spec{
+				Length:      19,
+				Description: "Primary Account Number",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+			3: field.NewBinary(&field.Spec{
+				Length:      8,
+				Description: "Binary field",
+				Enc:         encoding.Binary,
+				Pref:        prefix.Binary.Fixed,
+			}),
+			52: field.NewHex(&field.Spec{
+				Length:      8,
+				Description: "PIN Data",
+				Enc:         encoding.Binary,
+				Pref:        prefix.Binary.Fixed,
+			}),
+			35: field.NewTrack2(&field.Spec{
+				Length:      37,
+				Description: "Track 2 Data",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+			36: field.NewTrack3(&field.Spec{
+				Length:      104,
+				Description: "Track 3 Data",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LLL,
+			}),
+			45: field.NewTrack1(&field.Spec{
+				Length:      76,
+				Description: "Track 1 Data",
+				Enc:         encoding.ASCII,
+				Pref:        prefix.ASCII.LL,
+			}),
+		},
+	}
+
+	jsonData, err := ExportJSON(spec)
+	require.NoError(t, err)
+
+	fromJSON, err := ImportJSON(jsonData)
+	require.NoError(t, err)
+	require.Exactly(t, spec, fromJSON)
+
+	yamlData, err := ExportYAML(spec)
+	require.NoError(t, err)
+
+	fromYAML, err := ImportYAML(yamlData)
+	require.NoError(t, err)
+	require.Exactly(t, spec, fromYAML)
+}
+
+// emvICCDataSpecYAML is a BER-TLV composite as it appears in a real spec
+// document. It exercises the composite tag encoding and Hex subfields
+// together, which is how EMV data is described.
+const emvICCDataSpecYAML = `name: EMV ICC Data
+fields:
+    "55":
+        type: Composite
+        length: 999
+        description: ICC Data, EMV having multiple tags
+        prefix: ASCII.LLL
+        tag:
+            enc: BerTLVTag
+            sort: StringsByHex
+        subfields:
+            "82":
+                type: Hex
+                description: Application Interchange Profile
+                enc: Binary
+                prefix: BerTLV
+            "95":
+                type: Hex
+                description: Terminal Verification Results
+                enc: Binary
+                prefix: BerTLV
+            "9A":
+                type: Hex
+                description: Transaction Date
+                enc: Binary
+                prefix: BerTLV
+            "9F02":
+                type: Hex
+                description: Amount, Authorized
+                enc: Binary
+                prefix: BerTLV
+            "9F26":
+                type: Hex
+                description: Application Cryptogram
+                enc: Binary
+                prefix: BerTLV
+            "9F36":
+                type: Hex
+                description: Application Transaction Counter
+                enc: Binary
+                prefix: BerTLV
+`
+
+func TestImportExportEMVCompositeSpec(t *testing.T) {
+	spec, err := ImportYAML([]byte(emvICCDataSpecYAML))
+	require.NoError(t, err)
+
+	iccSpec := spec.Fields[55].Spec()
+	require.Equal(t, encoding.BerTLVTag, iccSpec.Tag.Enc)
+	require.Len(t, iccSpec.Subfields, 6)
+	require.Equal(t, "Application Cryptogram", iccSpec.Subfields["9F26"].Spec().Description)
+
+	exported, err := ExportYAML(spec)
+	require.NoError(t, err)
+
+	// Exporting is stable: importing the exported document and exporting it
+	// again produces the same bytes.
+	reimported, err := ImportYAML(exported)
+	require.NoError(t, err)
+	reexported, err := ExportYAML(reimported)
+	require.NoError(t, err)
+	require.Equal(t, string(exported), string(reexported))
+}
+
+// EBCDIC1047 is resolvable by name on import and by struct name on export.
+func TestExportImportEBCDIC1047Encoding(t *testing.T) {
+	spec := &iso8583.MessageSpec{
+		Name: "ebcdic 1047",
+		Fields: map[int]field.Field{
+			2: field.NewString(&field.Spec{
+				Length:      10,
+				Description: "EBCDIC 1047 field",
+				Enc:         encoding.EBCDIC1047,
+				Pref:        prefix.EBCDIC.Fixed,
+			}),
+		},
+	}
+
+	jsonData, err := ExportJSON(spec)
+	require.NoError(t, err)
+
+	fromJSON, err := ImportJSON(jsonData)
+	require.NoError(t, err)
+	require.Exactly(t, spec, fromJSON)
+}
+
+// A sort function the importer cannot resolve used to be exported by name and
+// then rejected on the way back in, so the round trip produced a document that
+// looked complete and would not load. The export is where a developer can still
+// do something about it.
+func TestExportRejectsASortTheImportCannotResolve(t *testing.T) {
+	custom := func(x []string) { _ = x }
+
+	spec := &iso8583.MessageSpec{
+		Name: "custom sort",
+		Fields: map[int]field.Field{
+			0: field.NewString(&field.Spec{Length: 4, Description: "MTI", Enc: encoding.ASCII, Pref: prefix.ASCII.Fixed}),
+			1: field.NewBitmap(&field.Spec{Description: "Bitmap", Enc: encoding.BytesToASCIIHex, Pref: prefix.Hex.Fixed}),
+			3: field.NewComposite(&field.Spec{
+				Length: 2, Description: "Composite", Pref: prefix.ASCII.Fixed,
+				Tag:       &field.TagSpec{Sort: custom},
+				Subfields: map[string]field.Field{"1": field.NewString(&field.Spec{Length: 2, Description: "a", Enc: encoding.ASCII, Pref: prefix.ASCII.Fixed})},
+			}),
+		},
+	}
+
+	_, err := ExportYAML(spec)
+	require.Error(t, err, "a spec whose sort cannot be resolved was exported anyway")
+	require.Contains(t, err.Error(), "unknown sort function")
+	require.Contains(t, err.Error(), "StringsByInt", "the error does not say which names are exportable")
+
+	_, err = ExportJSON(spec)
+	require.Error(t, err, "JSON export accepted what YAML export refused")
+}
+
+// The registered ones still export, and still come back.
+func TestAKnownSortStillRoundTrips(t *testing.T) {
+	spec := &iso8583.MessageSpec{
+		Name: "known sort",
+		Fields: map[int]field.Field{
+			0: field.NewString(&field.Spec{Length: 4, Description: "MTI", Enc: encoding.ASCII, Pref: prefix.ASCII.Fixed}),
+			1: field.NewBitmap(&field.Spec{Description: "Bitmap", Enc: encoding.BytesToASCIIHex, Pref: prefix.Hex.Fixed}),
+			3: field.NewComposite(&field.Spec{
+				Length: 2, Description: "Composite", Pref: prefix.ASCII.Fixed,
+				Tag:       &field.TagSpec{Sort: sort.StringsByInt},
+				Subfields: map[string]field.Field{"1": field.NewString(&field.Spec{Length: 2, Description: "a", Enc: encoding.ASCII, Pref: prefix.ASCII.Fixed})},
+			}),
+		},
+	}
+
+	out, err := ExportYAML(spec)
+	require.NoError(t, err)
+
+	back, err := ImportYAML(out)
+	require.NoError(t, err, "a spec this package exported could not be imported")
+	composite, ok := back.Fields[3].(*field.Composite)
+	require.True(t, ok)
+	require.Len(t, composite.Spec().Subfields, 1)
+}
+
+// An invalid composite spec must be reported, not fatal. Field constructors
+// panic on a bad spec by design, which is right for the static specs in this
+// package but not for a document arriving at runtime: ImportJSON and ImportYAML
+// promise an error, and a malformed file should not take the process with it.
+func TestImportRejectsInvalidCompositeSpecs(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "encoding on a composite",
+			yaml: `
+name: test
+fields:
+  "55": {type: Composite, length: 999, enc: ASCII, prefix: ASCII.LLL}
+`,
+			want: "only supports a nil Enc value",
+		},
+		{
+			name: "neither tag nor bitmap",
+			yaml: `
+name: test
+fields:
+  "55":
+    type: Composite
+    length: 999
+    prefix: ASCII.LLL
+    subfields:
+      "1": {type: String, length: 2, enc: ASCII, prefix: ASCII.Fixed}
+`,
+			want: "definition of Bitmap or Tag",
+		},
+		{
+			name: "padding on a composite",
+			yaml: `
+name: test
+fields:
+  "55":
+    type: Composite
+    length: 999
+    prefix: ASCII.LLL
+    padding: {type: Left, pad: "0"}
+    tag: {enc: BerTLVTag, sort: StringsByInt}
+    subfields:
+      "9F02": {type: String, length: 2, enc: ASCII, prefix: ASCII.Fixed}
+`,
+			want: "nil or None spec padding",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := ImportYAML([]byte(tc.yaml))
+			require.Error(t, err)
+			require.Nil(t, spec)
+			require.Contains(t, err.Error(), tc.want)
+			require.Contains(t, err.Error(), "55")
+		})
+	}
+}
