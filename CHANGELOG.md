@@ -2,6 +2,18 @@ You can find all changes on the Releases page here: https://github.com/b365tech/
 
 # Changelog
 
+## [v1.4.0]
+
+Syncs the fork with upstream's latest release.
+
+- Based on upstream tag: [moov-io/iso8583@v0.26.2](https://github.com/moov-io/iso8583/releases/tag/v0.26.2), up from v0.26.0.
+- **Security and robustness fixes for parsing untrusted input** that v1.3.0 lacks:
+  - Unknown TLV lengths in composite fields are bounds-checked (#427).
+  - A truncated unknown TLV value returns an error instead of panicking (#415/#416).
+  - `Track3.SetBytes` returns its unpack error.
+  - An invalid composite spec returns an error instead of panicking (#448).
+- cronos already runs upstream v0.26.1, from its Dependabot security-alert fix. This release lets every service use the fork without losing those fixes.
+
 ## [v1.3.0]
 
 Syncs the fork with upstream.
