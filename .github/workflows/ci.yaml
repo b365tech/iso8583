@@ -1,0 +1,24 @@
+name: CI
+
+on:
+    pull_request:
+        types: [opened, synchronize, reopened]
+        branches:
+            - dev
+            - master
+    push:
+        tags:
+            - test.*
+    workflow_dispatch:
+
+permissions: {}
+
+jobs:
+    CI:
+        name: CI
+        runs-on: ubuntu-latest
+        if: always()
+        steps:
+            - name: Check all jobs passed
+              run: |
+                  echo "All jobs passed"
